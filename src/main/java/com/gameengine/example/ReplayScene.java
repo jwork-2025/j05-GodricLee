@@ -31,10 +31,21 @@ public class ReplayScene extends Scene {
         }
         double t;
         java.util.List<EntityInfo> entities = new ArrayList<>();
+        // Optimization: Map for fast lookup by ID
+        Map<String, EntityInfo> entityMap = new HashMap<>();
     }
 
     private final List<Keyframe> keyframes = new ArrayList<>();
-    private final java.util.List<GameObject> objectList = new ArrayList<>();
+    private final Map<String, GameObject> replayObjects = new HashMap<>();
+    
+    // Recorded resolution
+    private int recordedWidth = 0;
+    private int recordedHeight = 0;
+    
+    // Visuals
+    private ParticleSystem particleSystem;
+    private int lastKeyframeIndex = -1;
+    private Random random = new Random();
 
     // 如果 path 为 null，则先展示 recordings 目录下的文件列表，供用户选择
     public ReplayScene(GameEngine engine, String path) {
@@ -48,14 +59,15 @@ public class ReplayScene extends Scene {
         super.initialize();
         this.renderer = engine.getRenderer();
         this.input = engine.getInputManager();
+        this.particleSystem = new ParticleSystem();
         // 重置状态，防止从列表进入后残留
         this.time = 0f;
         this.keyframes.clear();
-        this.objectList.clear();
+        this.replayObjects.clear();
+        this.lastKeyframeIndex = -1;
+        clear();
         if (recordingPath != null) {
             loadRecording(recordingPath);
-            buildObjectsFromFirstKeyframe();
-            
         } else {
             // 仅进入文件选择模式
             this.recordingFiles = null;
@@ -85,19 +97,33 @@ public class ReplayScene extends Scene {
         }
 
         // 查找区间
-        Keyframe a = keyframes.get(0);
-        Keyframe b = keyframes.get(keyframes.size() - 1);
+        int index = 0;
         for (int i = 0; i < keyframes.size() - 1; i++) {
-            Keyframe k1 = keyframes.get(i);
-            Keyframe k2 = keyframes.get(i + 1);
-            if (time >= k1.t && time <= k2.t) { a = k1; b = k2; break; }
+            if (time >= keyframes.get(i).t && time <= keyframes.get(i+1).t) {
+                index = i;
+                break;
+            }
         }
+        
+        // Detect events (entities disappearing/appearing)
+        // 检测事件：比较上一帧和当前帧的实体列表
+        // 如果上一帧存在的实体在当前帧消失了，说明它被销毁了（死亡/爆炸）
+        if (index != lastKeyframeIndex && lastKeyframeIndex != -1) {
+            processEvents(keyframes.get(lastKeyframeIndex), keyframes.get(index));
+        }
+        lastKeyframeIndex = index;
+        
+        Keyframe a = keyframes.get(index);
+        Keyframe b = keyframes.get(index + 1);
+        // 获取前一帧用于外推计算速度
+        Keyframe prev = index > 0 ? keyframes.get(index - 1) : null;
+
+        // 计算插值系数 u (0.0 到 1.0)
         double span = Math.max(1e-6, b.t - a.t);
         double u = Math.min(1.0, Math.max(0.0, (time - a.t) / span));
-        // 调试输出节流
-        
 
-        updateInterpolatedPositions(a, b, (float)u);
+        updateInterpolatedPositions(a, b, prev, (float)u, time);
+        particleSystem.update(deltaTime);
     }
 
     @Override
@@ -107,11 +133,50 @@ public class ReplayScene extends Scene {
             renderFileList();
             return;
         }
+        
+        // Draw a border indicating recorded area if available
+        if (recordedWidth > 0 && recordedHeight > 0) {
+            renderer.drawRect(0, 0, recordedWidth, recordedHeight, 0f, 0f, 0f, 0.2f); // Darker background for play area
+            // Draw border lines
+            renderer.drawLine(0, 0, recordedWidth, 0, 1, 1, 1, 0.5f);
+            renderer.drawLine(0, recordedHeight, recordedWidth, recordedHeight, 1, 1, 1, 0.5f);
+            renderer.drawLine(0, 0, 0, recordedHeight, 1, 1, 1, 0.5f);
+            renderer.drawLine(recordedWidth, 0, recordedWidth, recordedHeight, 1, 1, 1, 0.5f);
+        }
+
         // 基于 Transform 手动绘制（回放对象没有附带 RenderComponent）
         super.render();
+        particleSystem.render();
+        
         String hint = "REPLAY: ESC to return";
         float w = hint.length() * 12.0f;
         renderer.drawText(renderer.getWidth()/2.0f - w/2.0f, 30, hint, 0.8f, 0.8f, 0.8f, 1.0f);
+        
+        if (recordedWidth > 0) {
+            String res = "REC: " + recordedWidth + "x" + recordedHeight;
+            renderer.drawText(10, renderer.getHeight() - 20, res, 0.5f, 0.5f, 0.5f, 1f);
+        }
+    }
+    
+    private void processEvents(Keyframe oldFrame, Keyframe newFrame) {
+        // Detect disappeared entities (Death/Explosion)
+        // 遍历旧帧中的所有实体
+        for (Keyframe.EntityInfo ei : oldFrame.entities) {
+            // 如果新帧的Map中不包含该ID，说明该实体在这一帧之间被移除了
+            if (!newFrame.entityMap.containsKey(ei.id)) {
+                // Entity existed in old frame but not in new frame -> Died
+                // 根据ID前缀判断实体类型，生成对应的死亡特效
+                if (ei.id.startsWith("Enemy") && !ei.id.startsWith("EnemyBullet")) {
+                    particleSystem.emitExplosion(ei.pos, 20, 1.0f, 0.3f, 0.3f);
+                } else if (ei.id.startsWith("Bullet")) {
+                    particleSystem.emitExplosion(ei.pos, 5, 1.0f, 1.0f, 0.0f);
+                } else if (ei.id.startsWith("EnemyBullet")) {
+                    particleSystem.emitExplosion(ei.pos, 5, 0.8f, 0.2f, 0.8f);
+                } else if (ei.id.startsWith("PowerUp")) {
+                    particleSystem.emitExplosion(ei.pos, 15, 0.3f, 1.0f, 1.0f);
+                }
+            }
+        }
     }
 
     private void loadRecording(String path) {
@@ -119,7 +184,12 @@ public class ReplayScene extends Scene {
         com.gameengine.recording.RecordingStorage storage = new com.gameengine.recording.FileRecordingStorage();
         try {
             for (String line : storage.readLines(path)) {
-                if (line.contains("\"type\":\"keyframe\"")) {
+                if (line.contains("\"type\":\"header\"")) {
+                    try {
+                        recordedWidth = (int)com.gameengine.recording.RecordingJson.parseDouble(com.gameengine.recording.RecordingJson.field(line, "width"));
+                        recordedHeight = (int)com.gameengine.recording.RecordingJson.parseDouble(com.gameengine.recording.RecordingJson.field(line, "height"));
+                    } catch (Exception ignored) {}
+                } else if (line.contains("\"type\":\"keyframe\"")) {
                     Keyframe kf = new Keyframe();
                     kf.t = com.gameengine.recording.RecordingJson.parseDouble(com.gameengine.recording.RecordingJson.field(line, "t"));
                     // 解析 entities 列表中的若干 {"id":"name","x":num,"y":num}
@@ -152,6 +222,7 @@ public class ReplayScene extends Scene {
                                 }
                             }
                             kf.entities.add(ei);
+                            kf.entityMap.put(ei.id, ei);
                         }
                     }
                     keyframes.add(kf);
@@ -164,52 +235,202 @@ public class ReplayScene extends Scene {
     }
 
     private void buildObjectsFromFirstKeyframe() {
-        if (keyframes.isEmpty()) return;
-        Keyframe kf0 = keyframes.get(0);
-        // 按实体构建对象（使用预制），实现与游戏内一致外观
-        objectList.clear();
-        clear();
-        for (int i = 0; i < kf0.entities.size(); i++) {
-            GameObject obj = buildObjectFromEntity(kf0.entities.get(i), i);
-            addGameObject(obj);
-            objectList.add(obj);
-        }
-        time = 0f;
+        // Deprecated
     }
 
-    private void ensureObjectCount(int n) {
-        while (objectList.size() < n) {
-            GameObject obj = new GameObject("RObj#" + objectList.size());
-            obj.addComponent(new TransformComponent(new Vector2(0, 0)));
-            // 为回放对象添加可渲染组件（默认外观，稍后在 refreshRenderFromKeyframe 应用真实外观）
-            addGameObject(obj);
-            objectList.add(obj);
-        }
-        while (objectList.size() > n) {
-            GameObject obj = objectList.remove(objectList.size() - 1);
-            obj.setActive(false);
-        }
-    }
-
-    
-    private void updateInterpolatedPositions(Keyframe a, Keyframe b, float u) {
-        int n = Math.min(a.entities.size(), b.entities.size());
-        ensureObjectCount(n);
-        for (int i = 0; i < n; i++) {
-            Vector2 pa = a.entities.get(i).pos;
-            Vector2 pb = b.entities.get(i).pos;
-            float x = (float)((1.0 - u) * pa.x + u * pb.x);
-            float y = (float)((1.0 - u) * pa.y + u * pb.y);
-            GameObject obj = objectList.get(i);
+    private void updateInterpolatedPositions(Keyframe a, Keyframe b, Keyframe prev, float u, double currentTime) {
+        Set<String> currentIds = new HashSet<>();
+        
+        for (Keyframe.EntityInfo eiA : a.entities) {
+            String id = eiA.id;
+            currentIds.add(id);
+            
+            // Find corresponding entity in b using Map (O(1))
+            // 尝试在下一帧(b)中找到同名实体
+            Keyframe.EntityInfo eiB = b.entityMap.get(id);
+            
+            Vector2 pos;
+            if (eiB != null) {
+                // Standard interpolation
+                // 情况1：实体在两帧都存在 -> 线性插值 (Lerp)
+                // Pos = A * (1-u) + B * u
+                float x = (float)((1.0 - u) * eiA.pos.x + u * eiB.pos.x);
+                float y = (float)((1.0 - u) * eiA.pos.y + u * eiB.pos.y);
+                pos = new Vector2(x, y);
+            } else {
+                // Extrapolation: Object exists in A but not in B (destroyed in this interval)
+                // Try to calculate velocity from Prev -> A
+                // 情况2：实体在下一帧消失了（例如子弹击中敌人）
+                // 如果直接停止渲染，视觉上会觉得子弹突然消失。
+                // 解决方案：外推 (Extrapolation)。
+                // 利用前一帧(prev)和当前帧(a)计算速度，预测它在消失前的位置。
+                Keyframe.EntityInfo eiPrev = (prev != null) ? prev.entityMap.get(id) : null;
+                
+                if (eiPrev != null) {
+                    double dtPrev = a.t - prev.t;
+                    if (dtPrev > 0.0001) {
+                        // 计算速度 v = (PosA - PosPrev) / dt
+                        float vx = (float)((eiA.pos.x - eiPrev.pos.x) / dtPrev);
+                        float vy = (float)((eiA.pos.y - eiPrev.pos.y) / dtPrev);
+                        
+                        // 预测位置 = PosA + v * (currentTime - TimeA)
+                        double dtCurrent = currentTime - a.t;
+                        float x = eiA.pos.x + vx * (float)dtCurrent;
+                        float y = eiA.pos.y + vy * (float)dtCurrent;
+                        pos = new Vector2(x, y);
+                    } else {
+                        pos = eiA.pos;
+                    }
+                } else {
+                    pos = eiA.pos;
+                }
+            }
+            
+            // 获取或创建回放用的GameObject
+            GameObject obj = replayObjects.get(id);
+            if (obj == null) {
+                obj = buildObjectFromEntity(eiA, 0);
+                addGameObject(obj);
+                replayObjects.put(id, obj);
+            }
+            
+            // 更新位置
             TransformComponent tc = obj.getComponent(TransformComponent.class);
-            if (tc != null) tc.setPosition(new Vector2(x, y));
+            if (tc != null) tc.setPosition(pos);
+            obj.setActive(true);
+            
+            // Emit trails for active bullets
+            // 为移动中的子弹生成拖尾粒子
+            if (id.startsWith("Bullet")) {
+                particleSystem.emitTrail(pos, new Vector2(0, -1), 1.0f, 1.0f, 0.0f);
+            } else if (id.startsWith("EnemyBullet")) {
+                particleSystem.emitTrail(pos, new Vector2(0, 1), 0.8f, 0.2f, 0.8f);
+            }
+        }
+        
+        // Deactivate objects not in current frame
+        // 隐藏那些在当前帧数据中不存在的对象（对象池复用逻辑的一部分）
+        for (Map.Entry<String, GameObject> entry : replayObjects.entrySet()) {
+            if (!currentIds.contains(entry.getKey())) {
+                entry.getValue().setActive(false);
+            }
         }
     }
 
     private GameObject buildObjectFromEntity(Keyframe.EntityInfo ei, int index) {
         GameObject obj;
         if ("Player".equalsIgnoreCase(ei.id)) {
-            obj = com.gameengine.example.EntityFactory.createPlayerVisual(renderer);
+            // Reconstruct Player visual
+            obj = new GameObject("Player") {
+                @Override
+                public void render() {
+                    TransformComponent tc = getComponent(TransformComponent.class);
+                    if (tc == null) return;
+                    Vector2 pos = tc.getPosition();
+                    float bounce = (float) Math.sin(time * 3) * 2;
+                    renderer.drawRect(pos.x - 10, pos.y - 12 + bounce, 20, 24, 0.9f, 0.1f, 0.1f, 1.0f);
+                    renderer.drawCircle(pos.x, pos.y - 25 + bounce, 10, 16, 1.0f, 0.8f, 0.6f, 1.0f);
+                    renderer.drawCircle(pos.x - 4, pos.y - 26 + bounce, 2, 8, 0.0f, 0.0f, 0.0f, 1.0f);
+                    renderer.drawCircle(pos.x + 4, pos.y - 26 + bounce, 2, 8, 0.0f, 0.0f, 0.0f, 1.0f);
+                    renderer.drawRect(pos.x - 18, pos.y - 8 + bounce, 8, 16, 1.0f, 0.9f, 0.0f, 1.0f);
+                    renderer.drawRect(pos.x + 10, pos.y - 8 + bounce, 8, 16, 0.1f, 0.9f, 0.1f, 1.0f);
+                    renderer.drawRect(pos.x - 8, pos.y + 12, 8, 14, 0.2f, 0.5f, 1.0f, 1.0f);
+                    renderer.drawRect(pos.x + 2, pos.y + 12, 8, 14, 0.2f, 0.8f, 0.8f, 1.0f);
+                }
+            };
+        } else if (ei.id.startsWith("Enemy") && !ei.id.startsWith("EnemyBullet")) {
+            // Reconstruct Enemy visual
+            obj = new GameObject(ei.id) {
+                @Override
+                public void render() {
+                    TransformComponent tc = getComponent(TransformComponent.class);
+                    if (tc == null) return;
+                    Vector2 pos = tc.getPosition();
+                    float pulse = (float) Math.sin(time * 5) * 0.2f + 1.0f;
+                    renderer.drawCircle(pos.x + 12, pos.y + 12, 12 * pulse, 16, 0.8f, 0.2f, 0.8f, 0.9f);
+                    renderer.drawCircle(pos.x + 8, pos.y + 8, 2, 8, 1.0f, 0.0f, 0.0f, 1.0f);
+                    renderer.drawCircle(pos.x + 16, pos.y + 8, 2, 8, 1.0f, 0.0f, 0.0f, 1.0f);
+                    renderer.drawLine(pos.x + 8, pos.y, pos.x + 5, pos.y - 8, 0.6f, 0.1f, 0.6f, 1.0f);
+                    renderer.drawLine(pos.x + 16, pos.y, pos.x + 19, pos.y - 8, 0.6f, 0.1f, 0.6f, 1.0f);
+                }
+            };
+        } else if (ei.id.startsWith("PowerUp")) {
+            obj = new GameObject(ei.id) {
+                @Override
+                public void render() {
+                    TransformComponent tc = getComponent(TransformComponent.class);
+                    if (tc == null) return;
+                    Vector2 pos = tc.getPosition();
+                    float glow = (float) Math.sin(time * 6) * 0.3f + 0.7f;
+                    renderer.drawCircle(pos.x + 12, pos.y + 12, 18, 16, 0.0f, 1.0f, 1.0f, 0.2f * glow);
+                    renderer.drawCircle(pos.x + 12, pos.y + 12, 10, 16, 0.3f, 1.0f, 1.0f, glow);
+                    renderer.drawCircle(pos.x + 12, pos.y + 12, 6, 16, 1.0f, 1.0f, 1.0f, 1.0f);
+                }
+            };
+        } else if (ei.id.startsWith("BlackHole")) {
+            obj = new GameObject(ei.id) {
+                @Override
+                public void render() {
+                    TransformComponent tc = getComponent(TransformComponent.class);
+                    if (tc == null) return;
+                    Vector2 p = tc.getPosition();
+                    float pulse = (float) Math.sin(time * 6) * 0.3f + 0.7f;
+                    renderer.drawCircle(p.x, p.y, 80 * pulse, 32, 0.5f, 0.0f, 0.8f, 0.3f);
+                    renderer.drawCircle(p.x, p.y, 50, 32, 0.3f, 0.0f, 0.5f, 0.7f);
+                    renderer.drawCircle(p.x, p.y, 30, 32, 0.1f, 0.0f, 0.2f, 1.0f);
+                }
+            };
+        } else if (ei.id.startsWith("Bullet")) {
+            obj = new GameObject(ei.id) {
+                @Override
+                public void render() {
+                    TransformComponent tc = getComponent(TransformComponent.class);
+                    if (tc == null) return;
+                    Vector2 p = tc.getPosition();
+                    renderer.drawCircle(p.x, p.y, 8, 8, 1.0f, 1.0f, 0.0f, 1.0f);
+                }
+            };
+        } else if (ei.id.startsWith("EnemyBullet")) {
+            obj = new GameObject(ei.id) {
+                @Override
+                public void render() {
+                    TransformComponent tc = getComponent(TransformComponent.class);
+                    if (tc == null) return;
+                    Vector2 p = tc.getPosition();
+                    renderer.drawCircle(p.x, p.y, 6, 8, 0.8f, 0.2f, 0.8f, 1.0f);
+                }
+            };
+        } else if (ei.id.startsWith("Star")) {
+            obj = new GameObject(ei.id) {
+                @Override
+                public void render() {
+                    TransformComponent tc = getComponent(TransformComponent.class);
+                    if (tc == null) return;
+                    Vector2 p = tc.getPosition();
+                    renderer.drawCircle(p.x, p.y, 2, 4, 1.0f, 1.0f, 1.0f, 0.8f);
+                }
+            };
+        } else if (ei.id.startsWith("SlashEffect")) {
+            obj = new GameObject(ei.id) {
+                float startTime = -1;
+                @Override
+                public void render() {
+                    if (startTime < 0) startTime = time;
+                    float lifetime = 0.25f;
+                    float progress = (time - startTime) / lifetime;
+                    if (progress > 1.0f) progress = 1.0f;
+                    
+                    TransformComponent tc = getComponent(TransformComponent.class);
+                    if (tc == null) return;
+                    Vector2 playerPos = tc.getPosition();
+                    float slashRadius = 180f;
+                    float angle = -150f + 120f * progress;
+                    float rad = (float)Math.toRadians(angle);
+                    float x = playerPos.x + (float)Math.cos(rad) * slashRadius;
+                    float y = playerPos.y + (float)Math.sin(rad) * slashRadius;
+                    renderer.drawLine(playerPos.x, playerPos.y, x, y, 1f, 0.9f, 0.2f, 1f);
+                }
+            };
         } else if ("AIPlayer".equalsIgnoreCase(ei.id)) {
             float w2 = (ei.w > 0 ? ei.w : 20);
             float h2 = (ei.h > 0 ? ei.h : 20);
@@ -301,7 +522,48 @@ public class ReplayScene extends Scene {
         renderer.drawText(w/2f - hw/2f, h - 60, hint, 0.7f,0.7f,0.7f,1f);
     }
 
-    // 解析相关逻辑已移至 RecordingJson
+    private class ParticleSystem {
+        class Particle { Vector2 pos, vel; float life, maxLife; float r,g,b; }
+        List<Particle> particles = new ArrayList<>();
+        
+        public void update(float dt) {
+            Iterator<Particle> it = particles.iterator();
+            while(it.hasNext()) {
+                Particle p = it.next();
+                p.life -= dt;
+                if (p.life <= 0) it.remove();
+                else {
+                    p.pos = p.pos.add(p.vel.multiply(dt));
+                }
+            }
+        }
+        public void render() {
+            for(Particle p : particles) {
+                float a = p.life / p.maxLife;
+                renderer.drawRect(p.pos.x, p.pos.y, 4, 4, p.r, p.g, p.b, a);
+            }
+        }
+        public void emitTrail(Vector2 pos, Vector2 vel, float r, float g, float b) {
+            Particle p = new Particle();
+            p.pos = new Vector2(pos);
+            p.vel = vel.multiply(-0.1f).add(new Vector2((random.nextFloat()-0.5f)*20, (random.nextFloat()-0.5f)*20));
+            p.life = p.maxLife = 0.3f;
+            p.r=r; p.g=g; p.b=b;
+            particles.add(p);
+        }
+        public void emitExplosion(Vector2 pos, int count, float r, float g, float b) {
+            for(int i=0; i<count; i++) {
+                Particle p = new Particle();
+                p.pos = new Vector2(pos);
+                float angle = random.nextFloat() * 6.28f;
+                float speed = random.nextFloat() * 100 + 50;
+                p.vel = new Vector2((float)Math.cos(angle)*speed, (float)Math.sin(angle)*speed);
+                p.life = p.maxLife = 0.5f + random.nextFloat()*0.5f;
+                p.r=r; p.g=g; p.b=b;
+                particles.add(p);
+            }
+        }
+    }
 }
 
 
